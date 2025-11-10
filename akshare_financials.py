@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Fetch financial metrics for a given A-share using AKShare.
+"""Fetch key financial metrics for A-share companies via AKShare.
 
-This script pulls 江淮汽车（600418）在 2025 年三季报、中报、一季报
-以及 2024 年年报的关键指标，并自动计算与去年同期的对比值。
-运行后会在终端输出总表，必要时也可写入 Excel。
+默认展示 2024 年年报至 2025 年三季报的指标，可按需指定股票和期间，
+支持导出 Excel 并包含实时估值信息。
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from datetime import datetime
+import time
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -54,6 +55,19 @@ DISPLAY_METRIC_ORDER = [
     "资产负债率",
     "流动比率",
     "净资产",
+    # 估值
+    "市值",
+    "PE",
+    "PB",
+    "PS",
+    "估值",
+    "估值时间",
+    # 最后估值
+    "最新PE",
+    "最新PB",
+    "最新PS",
+    "最新估值",
+    "最新估值时间",
 ]
 
 PERCENT_METRICS = {
@@ -67,6 +81,8 @@ PERCENT_METRICS = {
     "ROE",
 }
 
+MULTIPLIER_METRICS = {"PE", "PB", "PS", "最新PE", "最新PB", "最新PS"}
+
 CURRENCY_KEYWORDS = (
     "收入",
     "现金",
@@ -79,7 +95,16 @@ CURRENCY_KEYWORDS = (
     "权益",
     "成本",
     "费用",
+    "市值",
 )
+
+LATEST_ONLY_METRICS = {
+    "最新PE": ("2025三季报", "本期"),
+    "最新PB": ("2025三季报", "本期"),
+    "最新PS": ("2025三季报", "本期"),
+    "最新估值": ("2025三季报", "本期"),
+    "最新估值时间": ("2025三季报", "本期"),
+}
 
 SECTION_DEFINITIONS = [
     (
@@ -111,6 +136,8 @@ SECTION_DEFINITIONS = [
             "投资活动现金流量净额",
             "销售商品提供劳务收到的现金",
             "现金收入比率",
+            "资本性支出",
+            "自由现金流",
         ],
     ),
     (
@@ -121,9 +148,40 @@ SECTION_DEFINITIONS = [
             "净资产",
         ],
     ),
+    (
+        "估值",
+        [
+            "市值",
+            "PE",
+            "PB",
+            "PS",
+            "估值",
+            "估值时间",
+        ],
+    ),
+    (
+        "最后估值",
+        [
+            "最新PE",
+            "最新PB",
+            "最新PS",
+            "最新估值",
+            "最新估值时间",
+        ],
+    ),
 ]
 
 INVALID_FILENAME_CHARS = set('\\/:*?"<>|')
+
+
+@dataclass(frozen=True)
+class LatestValuation:
+    pe: Optional[float]
+    pb: Optional[float]
+    ps: Optional[float]
+    timestamp: Optional[str]
+    price: Optional[float]
+    market_cap: Optional[float]
 
 
 @dataclass(frozen=True)
@@ -134,6 +192,10 @@ class Dataset:
     profit: pd.DataFrame
     cashflow: pd.DataFrame
     balance: pd.DataFrame
+    latest_price: Optional[float]
+    total_shares: Optional[float]
+    total_market_cap: Optional[float]
+    latest_valuation: Optional[LatestValuation]
 
 
 def convert_numeric(df: pd.DataFrame) -> pd.DataFrame:
@@ -163,17 +225,90 @@ def default_excel_filename(dataset: Dataset) -> str:
     return f"{safe_company}_{code_tag}.xlsx"
 
 
-def fetch_company_name(base_symbol: str) -> Optional[str]:
+def fetch_company_overview(base_symbol: str) -> Tuple[Optional[str], Optional[float], Optional[float], Optional[float]]:
     try:
         info_df = ak.stock_individual_info_em(symbol=base_symbol)
     except Exception:
-        return None
+        return None, None, None, None
     if info_df is None or info_df.empty:
-        return None
-    match = info_df.loc[info_df["item"].isin(["股票简称", "证券简称"])].head(1)
-    if match.empty:
-        return None
-    return str(match.iloc[0]["value"]).strip()
+        return None, None, None, None
+
+    info_map = {
+        str(row["item"]).strip(): row["value"]
+        for _, row in info_df.iterrows()
+    }
+
+    def to_float(value: object) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    name = info_map.get("股票简称") or info_map.get("证券简称")
+    company_name = str(name).strip() if name else None
+    latest_price = to_float(info_map.get("最新"))
+    total_shares = to_float(info_map.get("总股本"))
+    total_market_cap = to_float(info_map.get("总市值"))
+
+    return company_name, latest_price, total_shares, total_market_cap
+
+
+def fetch_latest_valuation(base_symbol: str, retries: int = 3, delay: float = 1.5) -> Optional[LatestValuation]:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        try:
+            spot_df = ak.stock_zh_a_spot_em()
+        except Exception as err:
+            last_error = err
+            print(f"警告: 获取最新估值失败（第 {attempt} 次），原因: {err}")
+            if attempt < retries:
+                time.sleep(delay)
+            continue
+
+        if spot_df is None or spot_df.empty:
+            print(f"警告: 获取最新估值失败（第 {attempt} 次），返回数据为空")
+            if attempt < retries:
+                time.sleep(delay)
+            continue
+
+        row = spot_df.loc[spot_df["代码"] == base_symbol]
+        if row.empty:
+            print(f"警告: 最新估值数据中未找到代码 {base_symbol}")
+            return None
+
+        record = row.iloc[0]
+
+        def to_float(value: object) -> Optional[float]:
+            if value is None or value == "":
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        pe = to_float(record.get("市盈率-动态")) or to_float(record.get("市盈率(TTM)"))
+        pb = to_float(record.get("市净率"))
+        ps = to_float(record.get("市销率")) or to_float(record.get("市销率(TTM)"))
+        price = to_float(record.get("最新价")) or to_float(record.get("现价"))
+        market_cap = (
+            to_float(record.get("总市值"))
+            or to_float(record.get("总市值-实时"))
+            or to_float(record.get("总市值-最新"))
+        )
+
+        timestamp = record.get("更新时间") or record.get("数据日期")
+        if timestamp is None or str(timestamp).strip() == "":
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            timestamp = str(timestamp)
+
+        return LatestValuation(pe=pe, pb=pb, ps=ps, timestamp=timestamp, price=price, market_cap=market_cap)
+
+    if last_error is not None:
+        print("警告: 多次尝试获取最新估值失败，已放弃。")
+    return None
 
 
 def is_currency_metric(metric: str) -> bool:
@@ -188,23 +323,36 @@ def is_currency_metric(metric: str) -> bool:
 
 
 def format_value(metric: str, value: Optional[float]) -> str:
-    if value is None or pd.isna(value):
+    if value is None:
+        return "-"
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else "-"
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if pd.isna(value):
         return "-"
     base_metric = metric.replace("-去年同期", "")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
     if base_metric in PERCENT_METRICS:
-        return f"{value * 100:.2f}%"
+        return f"{numeric * 100:.2f}%"
+    if base_metric in MULTIPLIER_METRICS:
+        return f"{numeric:.2f}倍"
     if base_metric.endswith("倍数") or "倍数" in base_metric:
-        return f"{value:.2f}倍"
+        return f"{numeric:.2f}倍"
     if "乘数" in base_metric:
-        return f"{value:.2f}倍"
+        return f"{numeric:.2f}倍"
     if is_currency_metric(metric):
-        absolute = abs(value)
+        absolute = abs(numeric)
         if absolute >= 1e8:
-            return f"{value / 1e8:.2f}亿"
+            return f"{numeric / 1e8:.2f}亿"
         if absolute >= 1e4:
-            return f"{value / 1e4:.2f}万"
-        return f"{value:.2f}元"
-    return f"{value:.2f}"
+            return f"{numeric / 1e4:.2f}万"
+        return f"{numeric:.2f}元"
+    return f"{numeric:.2f}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -272,6 +420,19 @@ def find_column(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
     return None
 
 
+def get_value_at(df: pd.DataFrame, date_str: str, column: Optional[str]) -> Optional[float]:
+    if column is None or column not in df.columns:
+        return None
+    ts = pd.Timestamp(date_str)
+    if ts not in df.index:
+        return None
+    value = df.at[ts, column]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_value(df: pd.DataFrame, report_date: str, column: Optional[str], years_offset: int = 0) -> Optional[float]:
     if column is None or column not in df.columns:
         return None
@@ -283,6 +444,52 @@ def get_value(df: pd.DataFrame, report_date: str, column: Optional[str], years_o
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def compute_period_market_caps(
+    dataset: Dataset, report_dates: Dict[str, str]
+) -> Dict[str, Dict[str, Optional[float]]]:
+    total_shares = dataset.total_shares
+    if total_shares in (None, 0) or pd.isna(total_shares):
+        return {}
+
+    if not report_dates:
+        return {}
+
+    report_ts = sorted(pd.Timestamp(date) for date in report_dates.values())
+    start = (report_ts[0] - pd.DateOffset(days=370)).strftime("%Y%m%d")
+    end = (report_ts[-1] + pd.DateOffset(days=5)).strftime("%Y%m%d")
+
+    symbol = strip_exchange_prefix(dataset.stock_code)
+    try:
+        hist_df = ak.stock_zh_a_hist(symbol=symbol, start_date=start, end_date=end, adjust="")
+    except Exception:
+        return {}
+
+    if hist_df is None or hist_df.empty or "收盘" not in hist_df.columns:
+        return {}
+
+    hist_df = hist_df.copy()
+    hist_df["日期"] = pd.to_datetime(hist_df["日期"])
+    hist_df = hist_df.set_index("日期").sort_index()
+    close_series = hist_df["收盘"].astype(float)
+
+    info: Dict[str, Dict[str, Optional[float]]] = {}
+    for label, date_str in report_dates.items():
+        ts = pd.Timestamp(date_str)
+        relevant = close_series.loc[:ts]
+        if relevant.empty:
+            continue
+        last_price = relevant.iloc[-1]
+        price = float(last_price)
+        price_time = relevant.index[-1]
+        info[label] = {
+            "market_cap": float(price) * float(total_shares),
+            "price": price,
+            "price_time": price_time,
+        }
+
+    return info
 
 
 def safe_sub(minuend: Optional[float], subtrahend: Optional[float]) -> Optional[float]:
@@ -314,6 +521,14 @@ def safe_product(values: Iterable[Optional[float]]) -> Optional[float]:
             return None
         result *= value
     return result
+
+
+def calc_ttm(current: Optional[float], prev_same_period: Optional[float], prev_year_end: Optional[float]) -> Optional[float]:
+    if current is None:
+        return None
+    if prev_same_period is None or prev_year_end is None:
+        return current
+    return current + (prev_year_end - prev_same_period)
 
 
 def metric_base(metric: str) -> str:
@@ -410,7 +625,32 @@ def combine_summary(summary: pd.DataFrame, period_order: Iterable[str]) -> pd.Da
         for column in columns:
             combined.at[metric, column] = values.get(column)
 
-    combined = combined.dropna(axis=0, how="all")
+    def first_nonempty(metric: str) -> Optional[object]:
+        if metric not in combined.index:
+            return None
+        for column in columns:
+            value = combined.at[metric, column]
+            if value not in (None, "") and not (isinstance(value, float) and pd.isna(value)):
+                return value
+        return None
+
+    for metric, target in LATEST_ONLY_METRICS.items():
+        if metric not in combined.index:
+            continue
+
+        period, col_type = target
+        target_col = (period, col_type)
+        if target_col not in combined.columns:
+            combined[target_col] = None
+
+        value = first_nonempty(metric)
+        combined.at[metric, target_col] = value
+
+        for column in columns:
+            if column == target_col:
+                continue
+            combined.at[metric, column] = None
+
     combined = combined.dropna(axis=1, how="all")
     combined.index.name = "指标"
     return combined
@@ -525,14 +765,20 @@ def load_statement(stock_code: str, indicator: str) -> pd.DataFrame:
 def fetch_datasets(symbol: str) -> Dataset:
     stock_code = normalize_stock(symbol)
     base_symbol = strip_exchange_prefix(stock_code)
-    company_name = fetch_company_name(base_symbol) or base_symbol.upper()
+    company_name, latest_price, total_shares, total_market_cap = fetch_company_overview(base_symbol)
+    company_label = company_name or base_symbol.upper()
+    latest_valuation = fetch_latest_valuation(base_symbol)
     return Dataset(
         symbol=symbol,
         stock_code=stock_code,
-        company_name=company_name,
+        company_name=company_label,
         profit=load_statement(stock_code, "利润表"),
         cashflow=load_statement(stock_code, "现金流量表"),
         balance=load_statement(stock_code, "资产负债表"),
+        latest_price=latest_price,
+        total_shares=total_shares,
+        total_market_cap=total_market_cap,
+        latest_valuation=latest_valuation,
     )
 
 
@@ -549,6 +795,50 @@ def build_summary(dataset: Dataset, report_dates: Dict[str, str]) -> pd.DataFram
     profit = dataset.profit
     cashflow = dataset.cashflow
     balance = dataset.balance
+    market_cap = dataset.total_market_cap
+    period_market_caps = compute_period_market_caps(dataset, report_dates)
+    latest_val = dataset.latest_valuation
+    latest_pe = latest_val.pe if latest_val else None
+    latest_pb = latest_val.pb if latest_val else None
+    latest_ps = latest_val.ps if latest_val else None
+    latest_time = latest_val.timestamp if latest_val else None
+    current_price = latest_val.price if latest_val else None
+    current_cap_value = latest_val.market_cap if latest_val else None
+
+    if current_price is None and dataset.latest_price is not None:
+        try:
+            current_price = float(dataset.latest_price)
+        except (TypeError, ValueError):
+            current_price = None
+
+    def format_amount(value: Optional[float]) -> Optional[str]:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return None
+        absolute = abs(value)
+        if absolute >= 1e8:
+            return f"{value / 1e8:.2f}亿"
+        if absolute >= 1e4:
+            return f"{value / 1e4:.2f}万"
+        return f"{value:.2f}元"
+
+    def format_time_value(value: Optional[object]) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, pd.Timestamp):
+            value = value.to_pydatetime()
+        if isinstance(value, datetime):
+            if value.hour == 0 and value.minute == 0 and value.second == 0:
+                return value.strftime("%Y-%m-%d")
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            ts = pd.Timestamp(value)
+        except Exception:
+            text = str(value).strip()
+            return text or None
+        return format_time_value(ts)
+
+    fallback_context: Optional[dict[str, object]] = None
+    latest_period_label = next(iter(report_dates)) if report_dates else None
 
     revenue_col = find_column(profit, ["营业总收入", "营业收入"])
     cost_col = find_column(profit, ["营业成本"])
@@ -598,6 +888,7 @@ def build_summary(dataset: Dataset, report_dates: Dict[str, str]) -> pd.DataFram
 
         net_profit = get_value(profit, date_str, net_profit_col, 0)
         net_profit_prev = get_value(profit, date_str, net_profit_col, 1)
+        net_profit_growth = calc_growth(net_profit, net_profit_prev)
 
         parent_net = get_value(profit, date_str, parent_net_col, 0)
         parent_net_prev = get_value(profit, date_str, parent_net_col, 1)
@@ -678,6 +969,54 @@ def build_summary(dataset: Dataset, report_dates: Dict[str, str]) -> pd.DataFram
         if roe_prev is None:
             roe_prev = safe_div(parent_net_prev, avg_equity_prev)
 
+        report_ts = pd.Timestamp(date_str)
+        prev_year_end = f"{report_ts.year - 1}-12-31"
+        net_profit_prev_year_end = get_value_at(profit, prev_year_end, net_profit_col)
+        ttm_net_profit = calc_ttm(net_profit, net_profit_prev, net_profit_prev_year_end)
+
+        period_info = period_market_caps.get(label)
+        period_cap_value: Optional[float] = None
+        period_price_value: Optional[float] = None
+        period_time_value: Optional[object] = None
+        used_latest_price = False
+
+        if period_info:
+            period_cap_value = period_info.get("market_cap")
+            period_price_value = period_info.get("price")
+            period_time_value = period_info.get("price_time")
+        else:
+            period_cap_value = market_cap
+
+        total_shares = dataset.total_shares
+        if period_price_value is None and period_cap_value is not None and total_shares not in (None, 0):
+            try:
+                period_price_value = float(period_cap_value) / float(total_shares)
+            except (TypeError, ValueError, ZeroDivisionError):
+                period_price_value = None
+
+        if (
+            period_price_value is None
+            and dataset.latest_price is not None
+        ):
+            try:
+                period_price_value = float(dataset.latest_price)
+                used_latest_price = True
+            except (TypeError, ValueError):
+                period_price_value = None
+
+        if period_time_value is None:
+            if used_latest_price and latest_time is not None:
+                period_time_value = latest_time
+            else:
+                try:
+                    period_time_value = pd.Timestamp(date_str)
+                except Exception:
+                    period_time_value = latest_time
+
+        pe = safe_div(period_cap_value, ttm_net_profit) if period_cap_value is not None else None
+        pb = safe_div(period_cap_value, net_assets) if period_cap_value is not None else None
+        ps = safe_div(period_cap_value, income) if period_cap_value is not None else None
+
         row.update(
             {
                 "营业收入": income,
@@ -722,12 +1061,124 @@ def build_summary(dataset: Dataset, report_dates: Dict[str, str]) -> pd.DataFram
                 "流动比率-去年同期": current_ratio_prev,
                 "净资产": net_assets,
                 "净资产-去年同期": net_assets_prev,
+                "市值": period_cap_value,
+                "PE": pe,
+                "PB": pb,
+                "PS": ps,
+                "最新PE": latest_pe,
+                "最新PB": latest_pb,
+                "最新PS": latest_ps,
+                "估值": None,
+                "估值时间": period_time_value,
+                "最新估值": None,
+                "最新估值时间": None,
             }
         )
 
+        if (
+            fallback_context is None
+            or pd.Timestamp(date_str) > fallback_context.get("ts", pd.Timestamp.min)
+        ):
+            fallback_context = {
+                "ts": pd.Timestamp(date_str),
+                "ttm_net_profit": ttm_net_profit,
+                "net_assets": net_assets,
+                "income": income,
+            }
+
+        cap_text = format_amount(period_cap_value)
+        price_text_for_row = format_amount(period_price_value)
+        if cap_text and price_text_for_row:
+            row["市值"] = f"{cap_text}（股价：{price_text_for_row}）"
+        elif cap_text:
+            row["市值"] = cap_text
+        elif price_text_for_row:
+            row["市值"] = f"股价：{price_text_for_row}"
+        else:
+            row["市值"] = None
+
+        summary_parts_for_period: list[str] = []
+        if price_text_for_row:
+            summary_parts_for_period.append(f"股价：{price_text_for_row}")
+        if cap_text:
+            summary_parts_for_period.append(f"市值：{cap_text}")
+        if summary_parts_for_period:
+            row["估值"] = " | ".join(summary_parts_for_period)
+        else:
+            row["估值"] = None
+
         rows.append(row)
 
-    return pd.DataFrame(rows).set_index("期间")
+    summary_df = pd.DataFrame(rows).set_index("期间")
+
+    if "估值时间" in summary_df.columns:
+        summary_df["估值时间"] = summary_df["估值时间"].apply(format_time_value)
+    if "最新估值时间" in summary_df.columns:
+        summary_df["最新估值时间"] = summary_df["最新估值时间"].apply(format_time_value)
+
+    for col in ("市值", "估值", "估值时间", "最新估值", "最新估值时间"):
+        if col in summary_df.columns:
+            summary_df[col] = summary_df[col].astype("object")
+
+    if summary_df.empty:
+        return summary_df
+
+    def is_missing(value: Optional[float]) -> bool:
+        return value is None or (isinstance(value, float) and pd.isna(value))
+
+    if fallback_context is not None:
+        if current_cap_value is None:
+            current_cap_value = dataset.total_market_cap
+        if current_cap_value is None and dataset.latest_price is not None and dataset.total_shares not in (None, 0):
+            try:
+                current_cap_value = float(dataset.latest_price) * float(dataset.total_shares)
+            except (TypeError, ValueError):
+                current_cap_value = None
+
+        if current_price is None and current_cap_value is not None and dataset.total_shares not in (None, 0):
+            try:
+                current_price = float(current_cap_value) / float(dataset.total_shares)
+            except (TypeError, ValueError):
+                current_price = None
+
+        if current_cap_value is not None:
+            fallback_pe = safe_div(current_cap_value, fallback_context.get("ttm_net_profit"))
+            fallback_pb = safe_div(current_cap_value, fallback_context.get("net_assets"))
+            fallback_ps = safe_div(current_cap_value, fallback_context.get("income"))
+
+            if is_missing(latest_pe) and fallback_pe is not None:
+                latest_pe = fallback_pe
+                summary_df["最新PE"] = latest_pe
+            if is_missing(latest_pb) and fallback_pb is not None:
+                latest_pb = fallback_pb
+                summary_df["最新PB"] = latest_pb
+            if is_missing(latest_ps) and fallback_ps is not None:
+                latest_ps = fallback_ps
+                summary_df["最新PS"] = latest_ps
+
+            if latest_time is None or str(latest_time).strip() == "":
+                latest_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    latest_summary_text = None
+    price_text = format_amount(current_price) if current_price is not None else None
+    cap_text = format_amount(current_cap_value) if current_cap_value is not None else None
+    time_text_formatted = format_time_value(latest_time)
+
+    summary_parts = []
+    if price_text:
+        summary_parts.append(f"股价：{price_text}")
+    if cap_text:
+        summary_parts.append(f"市值：{cap_text}")
+    if summary_parts:
+        latest_summary_text = " | ".join(summary_parts)
+
+    if latest_period_label and latest_period_label in summary_df.index:
+        if latest_summary_text is not None:
+            summary_df.at[latest_period_label, "最新估值"] = latest_summary_text
+        if time_text_formatted is not None:
+            summary_df.at[latest_period_label, "最新估值时间"] = time_text_formatted
+
+    return summary_df
 
 
 def display_dataframe(table: pd.DataFrame, periods: Iterable[str]) -> None:
@@ -894,7 +1345,7 @@ def main() -> None:
     if args.symbol:
         symbols.append(args.symbol)
     if not symbols:
-        symbols = ["600418"]
+        symbols = ["000002"]
 
     excel_arg = Path(args.excel) if args.excel else None
     multi = len(symbols) > 1
