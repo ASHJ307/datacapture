@@ -29,24 +29,28 @@ DEFAULT_REPORT_DATES: Dict[str, str] = {
 }
 
 DISPLAY_METRIC_ORDER = [
+    # 利润表
     "营业收入",
     "营业收入增长率",
     "毛利率",
     "营业利润率",
-    "净利润",
     "净利润率",
+    "净利润",
     "归母净利润",
+    # ROE
     "归母净利润率",
     "总资产周转率",
     "权益乘数",
     "ROE",
+    # 现金流量表
     "经营活动现金流量净额",
     "净利润现金保障倍数",
-    "资本性支出",
     "投资活动现金流量净额",
-    "自由现金流",
     "销售商品提供劳务收到的现金",
     "现金收入比率",
+    "资本性支出",
+    "自由现金流",
+    # 资产负债表
     "资产负债率",
     "流动比率",
     "净资产",
@@ -80,44 +84,42 @@ CURRENCY_KEYWORDS = (
 SECTION_DEFINITIONS = [
     (
         "利润表",
-        {
+        [
             "营业收入",
             "营业收入增长率",
             "毛利率",
             "营业利润率",
-            "净利润",
             "净利润率",
+            "净利润",
             "归母净利润",
-        },
+        ],
     ),
     (
         "ROE",
-        {
+        [
             "归母净利润率",
             "总资产周转率",
             "权益乘数",
             "ROE",
-        },
+        ],
     ),
     (
         "现金流量表",
-        {
+        [
             "经营活动现金流量净额",
             "净利润现金保障倍数",
-            "资本性支出",
             "投资活动现金流量净额",
-            "自由现金流",
             "销售商品提供劳务收到的现金",
             "现金收入比率",
-        },
+        ],
     ),
     (
         "资产负债表",
-        {
+        [
             "资产负债率",
             "流动比率",
             "净资产",
-        },
+        ],
     ),
 ]
 
@@ -774,19 +776,19 @@ def maybe_export_excel(
 
         ws.freeze_panes = "B2"
         ws.sheet_view.showGridLines = False
-        ws.row_dimensions[1].height = 26
+        ws.row_dimensions[1].height = 39
 
-        header_font = Font(bold=True, color="333333")
+        header_font = Font(name="微软雅黑", color="333333")
         header_fill = PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
         header_alignment = Alignment(horizontal="center", vertical="center")
         thin_side = Side(style="thin", color="DDDDDD")
         header_border = Border(top=thin_side, bottom=thin_side, left=thin_side, right=thin_side)
         indicator_fill = PatternFill(start_color="F0F5FF", end_color="F0F5FF", fill_type="solid")
         body_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-        indicator_font = Font(bold=True, color="204060")
-        body_font = Font(color="333333")
+        indicator_font = Font(name="微软雅黑", color="204060")
+        body_font = Font(name="微软雅黑", color="333333")
         section_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-        section_font = Font(bold=True, color="7F6000")
+        section_font = Font(name="微软雅黑", color="7F6000")
         separator_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
         zebra_fill = PatternFill(start_color="EDF2FA", end_color="EDF2FA", fill_type="solid")
 
@@ -816,9 +818,9 @@ def maybe_export_excel(
             if is_blank_row:
                 ws.row_dimensions[row_cells[0].row].height = 8
             elif is_section_row:
-                ws.row_dimensions[row_cells[0].row].height = 26
+                ws.row_dimensions[row_cells[0].row].height = 39
             else:
-                ws.row_dimensions[row_cells[0].row].height = 22
+                ws.row_dimensions[row_cells[0].row].height = 33
                 data_row_counter += 1
             apply_zebra = (not is_blank_row and not is_section_row and data_row_counter % 2 == 1)
 
@@ -858,7 +860,7 @@ def maybe_export_excel(
                     cell.fill = indicator_fill
                     cell.alignment = Alignment(horizontal="center", vertical="center")
                 else:
-                    cell.font = Font(bold=True, color="333333")
+                    cell.font = Font(name="微软雅黑", color="333333")
                     cell.alignment = Alignment(horizontal="center", vertical="center")
                     if isinstance(cell.value, (int, float)):
                         cell.number_format = "0.00"
@@ -905,8 +907,6 @@ def main() -> None:
             else:
                 excel_dir = excel_arg
             excel_dir.mkdir(parents=True, exist_ok=True)
-            if excel_arg.suffix:
-                print(f"提示: 多股票模式下已将导出目录调整为 {excel_dir}")
         else:
             if excel_arg.is_dir() or not excel_arg.suffix:
                 excel_dir = excel_arg
@@ -919,10 +919,6 @@ def main() -> None:
         summary = build_summary(dataset, report_dates)
         combined_table = combine_summary(summary, ordered_periods)
 
-        header = f"\n====== {dataset.company_name} ({strip_exchange_prefix(dataset.stock_code).upper()}) ======"
-        print(header)
-        display_dataframe(combined_table, ordered_periods)
-
         export_path: Optional[Path] = None
         if excel_arg:
             if multi:
@@ -934,6 +930,9 @@ def main() -> None:
                     export_path = excel_dir / default_excel_filename(dataset)
                 else:
                     export_path = excel_arg
+        else:
+            # 如果没有指定 Excel 路径，使用默认文件名
+            export_path = Path.cwd() / default_excel_filename(dataset)
 
         maybe_export_excel(combined_table, export_path, dataset, ordered_periods)
 
